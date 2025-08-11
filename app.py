@@ -10,39 +10,45 @@ app = FastAPI()
 DOWNLOAD_DIR = './downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Configuration
+# Config: Max active parallel downloads
 MAX_ACTIVE_DOWNLOADS = 2
 
-# Queues and status tracking
+# Status trackers
 download_queue = deque()
 active_downloads = {}
 completed_files = {}
 downloading_tasks = {}
 
 async def download_worker():
-    """Background worker to manage download queue."""
+    """Background worker to manage queued downloads."""
     while True:
-        # If we have space for more active downloads
         if len(active_downloads) < MAX_ACTIVE_DOWNLOADS and download_queue:
             magnet = download_queue.popleft()
             task = asyncio.create_task(handle_download(magnet))
             downloading_tasks[magnet] = task
-        
-        await asyncio.sleep(2)  # Prevent CPU overuse
+        await asyncio.sleep(2)
 
 async def handle_download(magnet):
     torrent = TorrentDownloader(magnet, DOWNLOAD_DIR)
-    active_downloads[magnet] = "Starting..."
+    active_downloads[magnet] = {"status": "Connecting to peers..."}
+
     await torrent.start_download()
 
+    # Update status every 2 seconds
     while torrent.status.is_downloading:
-        active_downloads[magnet] = f"{torrent.status.progress:.2f}%"
+        active_downloads[magnet] = {
+            "status": "Downloading",
+            "progress": f"{torrent.status.progress:.2f}%",
+            "download_speed": f"{torrent.status.download_rate / 1024:.2f} KB/s",
+            "peers": torrent.status.num_peers
+        }
         await asyncio.sleep(2)
 
+    # On completion
     if torrent.status.is_finished:
         active_downloads.pop(magnet, None)
         completed_files[magnet] = torrent.files
-        print(f"Finished: {torrent.files}")
+        print(f"Download finished: {torrent.files}")
 
     await torrent.stop_download()
     downloading_tasks.pop(magnet, None)
@@ -59,14 +65,10 @@ def home():
 async def download_torrent(request: Request):
     data = await request.json()
     magnet_link = data.get("magnet")
-
     if not magnet_link:
-        return {"error": "Please provide a magnet link in JSON format: {'magnet': 'your_link'}"}
-
-    # Avoid duplicates
-    if magnet_link in active_downloads or magnet_link in [m for m in download_queue]:
+        return {"error": "Please provide a magnet link as JSON: {'magnet': 'link'}"}
+    if magnet_link in active_downloads or magnet_link in download_queue:
         return {"status": "Already queued or downloading", "magnet": magnet_link}
-    
     download_queue.append(magnet_link)
     return {"status": "Queued for download", "queue_position": len(download_queue), "magnet": magnet_link}
 
@@ -94,3 +96,4 @@ def download_file(filename: str):
     if os.path.exists(file_path):
         return FileResponse(file_path, filename=filename)
     return {"error": "File not found"}
+    
