@@ -2,7 +2,7 @@ import asyncio
 import os
 from collections import deque
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import PlainTextResponse, HTMLResponse, FileResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, FileResponse, Response
 from torrentp import TorrentDownloader
 
 app = FastAPI()
@@ -61,7 +61,7 @@ async def handle_download(magnet):
 
         active_downloads[magnet] = {
             "status": "Downloading",
-            "progress": f"{progress:.2f}%",
+            "progress": f"{progress:.2f}%" if progress is not None else "0%",
             "download_speed": f"{speed_bps / 1024:.2f} KB/s" if speed_bps else "0 KB/s",
             "peers": peers if peers is not None else "N/A",
             "eta": eta_str
@@ -97,7 +97,7 @@ def add_magnet_form():
     <body style="font-family:Arial">
       <h2>Add Magnet Link</h2>
       <form action="/download" method="post">
-        <input type="text" name="magnet" size="80" placeholder="Paste magnet link" required>
+        <input type="text" name="magnet" size="80" placeholder="Paste magnet link here" required>
         <br><br>
         <input type="submit" value="Add to Queue">
       </form>
@@ -105,7 +105,7 @@ def add_magnet_form():
     </body></html>
     """
 
-# ===== Improved Dashboard ===== #
+# ===== Dashboard ===== #
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
@@ -137,7 +137,6 @@ def dashboard():
             const speed = info.download_speed || "0 KB/s";
             const peers = (info.peers !== undefined && info.peers !== null) ? info.peers : "N/A";
             const eta = info.eta || "Unknown";
-
             c.innerHTML += `<div class="torrent">
                 <div><b>Status:</b> ${status}</div>
                 <div><b>Magnet:</b> ${magnet}</div>
@@ -157,7 +156,6 @@ def dashboard():
           console.error("Error loading progress:", err);
         }
       }
-
       async function loadCompleted(){
         try {
           const r = await fetch('/completed');
@@ -173,20 +171,13 @@ def dashboard():
               c.innerHTML += `<div><a href="${url}" target="_blank">${fileName}</a></div>`;
             });
           }
-          if (!hasFiles) {
-            c.innerHTML = "<p>No completed downloads</p>";
-          }
+          if (!hasFiles) c.innerHTML = "<p>No completed downloads</p>";
         } catch (err) {
           console.error("Error loading completed:", err);
         }
       }
-
-      async function refresh(){
-        await loadProgress();
-        await loadCompleted();
-      }
-      setInterval(refresh, 5000);
-      refresh();
+      async function refresh(){await loadProgress();await loadCompleted();}
+      setInterval(refresh, 5000); refresh();
       </script>
     </body>
     </html>
@@ -258,4 +249,14 @@ async def cancel_download(request: Request):
         download_queue.remove(magnet)
         return {"status": "Removed from queue"}
     return {"status": "Not found"}
-    
+
+# ===== Flash crossdomain.xml Support ===== #
+@app.get("/crossdomain.xml")
+def crossdomain():
+    xml = """<?xml version="1.0"?>
+    <!DOCTYPE cross-domain-policy SYSTEM "http://www.macromedia.com/xml/dtds/cross-domain-policy.dtd">
+    <cross-domain-policy>
+        <allow-access-from domain="*" secure="false"/>
+    </cross-domain-policy>
+    """
+    return Response(content=xml, media_type="application/xml")
