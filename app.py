@@ -1,6 +1,8 @@
 import asyncio
 import os
+import time
 from collections import deque
+from pathlib import Path
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import PlainTextResponse, HTMLResponse, FileResponse, Response
 from torrentp import TorrentDownloader
@@ -33,16 +35,18 @@ async def handle_download(magnet):
     await torrent.start_download()
 
     no_peer_start_time = None
-    while torrent.status.is_downloading:
-        peers = torrent.status.num_peers
-        progress = torrent.status.progress
-        speed_bps = torrent.status.download_rate
+    start_time = time.time()
 
-        # Auto-cancel if no peers > 2 min
+    while not torrent.status.is_finished:
+        peers = torrent.status.num_peers or 0
+        progress = torrent.status.progress or 0.0
+        speed_bps = torrent.status.download_rate or 0
+
+        # Auto-cancel if no peers for > 2 min
         if peers == 0:
             if no_peer_start_time is None:
-                no_peer_start_time = asyncio.get_running_loop().time()
-            elif asyncio.get_running_loop().time() - no_peer_start_time > 120:
+                no_peer_start_time = time.time()
+            elif time.time() - no_peer_start_time > 120:
                 print(f"[AUTO-CANCEL] No peers for 2 minutes: {magnet}")
                 await torrent.stop_download()
                 active_downloads.pop(magnet, None)
@@ -61,9 +65,9 @@ async def handle_download(magnet):
 
         active_downloads[magnet] = {
             "status": "Downloading",
-            "progress": f"{progress:.2f}%" if progress is not None else "0%",
-            "download_speed": f"{speed_bps / 1024:.2f} KB/s" if speed_bps else "0 KB/s",
-            "peers": peers if peers is not None else "N/A",
+            "progress": f"{progress:.2f}%",
+            "download_speed": f"{speed_bps / 1024:.2f} KB/s",
+            "peers": peers,
             "eta": eta_str
         }
         await asyncio.sleep(2)
@@ -73,10 +77,12 @@ async def handle_download(magnet):
         active_downloads.pop(magnet, None)
         completed_files[magnet] = []
         for file in torrent.files:
-            path = os.path.join(DOWNLOAD_DIR, file)
-            if os.path.exists(path):
+            path = Path(DOWNLOAD_DIR) / file
+            if path.exists():
                 completed_files[magnet].append({
                     "file": file,
+                    "size": f"{path.stat().st_size / (1024*1024):.2f} MB",
+                    "finished_at": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())),
                     "download_url": f"/file/{file}"
                 })
         print(f"✅ Finished: {torrent.files}")
@@ -105,79 +111,111 @@ def add_magnet_form():
     </body></html>
     """
 
-# ===== Dashboard ===== #
+# ===== Bootstrap Dashboard ===== #
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
     <html>
     <head>
       <title>Torrent Dashboard</title>
-      <style>
-        body { font-family: Arial; margin: 20px; }
-        .torrent { border: 1px solid #ccc; padding: 10px; margin-bottom: 15px; }
-        .progress-container { background: #eee; height: 20px; border-radius: 5px; overflow:hidden; }
-        .progress-bar { background: #4caf50; height: 100%; width: 0%; transition: width 0.5s; }
-      </style>
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     </head>
-    <body>
-      <h2>Active Downloads</h2>
-      <div id="active"></div>
-      <h2>Completed Downloads</h2>
-      <div id="completed"></div>
+    <body class="bg-light">
+      <div class="container my-4">
+        <h1 class="mb-4 text-center">📥 Torrent Dashboard</h1>
+
+        <!-- Active Downloads -->
+        <div class="card mb-4 shadow-sm">
+          <div class="card-header bg-primary text-white">Active Downloads</div>
+          <div class="card-body" id="active">
+            <p class="text-muted">Loading...</p>
+          </div>
+        </div>
+
+        <!-- Queue -->
+        <div class="card mb-4 shadow-sm">
+          <div class="card-header bg-warning">Queue</div>
+          <div class="card-body" id="queue">
+            <p class="text-muted">Loading...</p>
+          </div>
+        </div>
+
+        <!-- Completed Downloads -->
+        <div class="card mb-4 shadow-sm">
+          <div class="card-header bg-success text-white">Completed Downloads</div>
+          <div class="card-body" id="completed">
+            <p class="text-muted">Loading...</p>
+          </div>
+        </div>
+      </div>
+
       <script>
       async function loadProgress(){
-        try {
-          const r = await fetch('/progress');
-          const data = await r.json();
-          const c = document.getElementById('active');
-          c.innerHTML = '';
-          for (const [magnet, info] of Object.entries(data.active_downloads)) {
-            const prog = info.progress ? parseFloat(info.progress) : 0;
-            const status = info.status || "Unknown";
-            const speed = info.download_speed || "0 KB/s";
-            const peers = (info.peers !== undefined && info.peers !== null) ? info.peers : "N/A";
-            const eta = info.eta || "Unknown";
-            c.innerHTML += `<div class="torrent">
-                <div><b>Status:</b> ${status}</div>
-                <div><b>Magnet:</b> ${magnet}</div>
-                <div><b>Speed:</b> ${speed} |
-                     <b>Peers:</b> ${peers} |
-                     <b>ETA:</b> ${eta}</div>
-                <div><b>Progress:</b> ${info.progress || "0%"} </div>
-                <div class="progress-container">
-                    <div class="progress-bar" style="width:${prog}%;"></div>
+        const r = await fetch('/progress');
+        const data = await r.json();
+        const c = document.getElementById('active');
+        c.innerHTML = '';
+        for (const [magnet, info] of Object.entries(data.active_downloads)) {
+          const prog = info.progress ? parseFloat(info.progress) : 0;
+          const badgeClass = info.status.includes("Downloading") ? "bg-info" : "bg-secondary";
+          c.innerHTML += `
+            <div class="mb-3">
+              <h6><span class="badge ${badgeClass}">${info.status}</span></h6>
+              <div class="small text-break"><b>Magnet:</b> ${magnet}</div>
+              <div class="small"><b>Speed:</b> ${info.download_speed} | <b>Peers:</b> ${info.peers} | <b>ETA:</b> ${info.eta}</div>
+              <div class="progress mt-2">
+                <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:${prog}%">
+                  ${info.progress}
                 </div>
-            </div>`;
-          }
-          if (Object.keys(data.active_downloads).length === 0) {
-            c.innerHTML = "<p>No active downloads</p>";
-          }
-        } catch (err) {
-          console.error("Error loading progress:", err);
+              </div>
+            </div>
+          `;
+        }
+        if (Object.keys(data.active_downloads).length === 0) {
+          c.innerHTML = "<p class='text-muted'>No active downloads</p>";
         }
       }
+
+      async function loadQueue(){
+        const r = await fetch('/queue');
+        const data = await r.json();
+        const c = document.getElementById('queue');
+        if (data.queue.length > 0) {
+          c.innerHTML = '<ul class="list-group">';
+          data.queue.forEach((m, i) => {
+            c.innerHTML += `<li class="list-group-item"><b>${i+1}.</b> ${m}</li>`;
+          });
+          c.innerHTML += '</ul>';
+        } else {
+          c.innerHTML = "<p class='text-muted'>Queue is empty</p>";
+        }
+      }
+
       async function loadCompleted(){
-        try {
-          const r = await fetch('/completed');
-          const data = await r.json();
-          const c = document.getElementById('completed');
-          c.innerHTML = '';
-          let hasFiles = false;
-          for (const [magnet, files] of Object.entries(data.completed_files)) {
-            files.forEach(f => {
-              hasFiles = true;
-              const fileName = f.file || "Unnamed file";
-              const url = f.download_url || "#";
-              c.innerHTML += `<div><a href="${url}" target="_blank">${fileName}</a></div>`;
-            });
-          }
-          if (!hasFiles) c.innerHTML = "<p>No completed downloads</p>";
-        } catch (err) {
-          console.error("Error loading completed:", err);
+        const r = await fetch('/completed');
+        const data = await r.json();
+        const c = document.getElementById('completed');
+        let html = '';
+        let hasFiles = false;
+        for (const [magnet, files] of Object.entries(data.completed_files)) {
+          files.forEach(f => {
+            hasFiles = true;
+            html += `<div class="mb-2">
+              <a href="${f.download_url}" target="_blank" class="text-decoration-none">${f.file}</a>
+              <span class="badge bg-secondary">${f.size}</span>
+              <small class="text-muted">Finished at ${f.finished_at}</small>
+            </div>`;
+          });
         }
+        c.innerHTML = hasFiles ? html : "<p class='text-muted'>No completed downloads</p>";
       }
-      async function refresh(){await loadProgress();await loadCompleted();}
-      setInterval(refresh, 5000); refresh();
+
+      async function refresh(){
+        await loadProgress();
+        await loadQueue();
+        await loadCompleted();
+      }
+      setInterval(refresh, 2000); refresh();
       </script>
     </body>
     </html>
@@ -198,8 +236,8 @@ async def download_torrent(request: Request, magnet: str = Form(None)):
             return {"error": "Provide magnet in form or JSON"}
     if not magnet:
         return {"error": "No magnet link provided"}
-    if magnet in active_downloads or magnet in download_queue:
-        return {"status": "Already queued/downloading"}
+    if magnet in active_downloads or magnet in download_queue or magnet in completed_files:
+        return {"status": "Already queued/downloading/completed"}
     download_queue.append(magnet)
     return {"status": "Queued", "queue_position": len(download_queue)}
 
@@ -229,9 +267,9 @@ def list_completed():
 
 @app.get("/file/{filename}")
 def download_file(filename: str):
-    path = os.path.join(DOWNLOAD_DIR, filename)
-    if os.path.exists(path):
-        return FileResponse(path, filename=filename)
+    path = Path(DOWNLOAD_DIR) / filename
+    if path.exists() and path.is_file() and path.resolve().parent == Path(DOWNLOAD_DIR).resolve():
+        return FileResponse(str(path), filename=filename)
     return {"error": "File not found"}
 
 @app.post("/cancel")
