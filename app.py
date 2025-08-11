@@ -7,7 +7,7 @@ from torrentp import TorrentDownloader
 
 app = FastAPI()
 
-# ===== Torrent Downloader Config ===== #
+# ===== Config ===== #
 DOWNLOAD_DIR = './downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 MAX_ACTIVE_DOWNLOADS = 2
@@ -26,7 +26,7 @@ async def download_worker():
             downloading_tasks[magnet] = task
         await asyncio.sleep(2)
 
-# ===== Torrent Handler ===== #
+# ===== Download Handler ===== #
 async def handle_download(magnet):
     torrent = TorrentDownloader(magnet, DOWNLOAD_DIR)
     active_downloads[magnet] = {"status": "Connecting to peers..."}
@@ -51,7 +51,7 @@ async def handle_download(magnet):
         else:
             no_peer_start_time = None
 
-        # ETA calculation
+        # ETA
         eta_str = "Calculating..."
         if speed_bps > 0 and progress < 100.0:
             bytes_remaining = (torrent.status.total_size * (100 - progress)) / 100
@@ -62,8 +62,8 @@ async def handle_download(magnet):
         active_downloads[magnet] = {
             "status": "Downloading",
             "progress": f"{progress:.2f}%",
-            "download_speed": f"{speed_bps / 1024:.2f} KB/s",
-            "peers": peers,
+            "download_speed": f"{speed_bps / 1024:.2f} KB/s" if speed_bps else "0 KB/s",
+            "peers": peers if peers is not None else "N/A",
             "eta": eta_str
         }
         await asyncio.sleep(2)
@@ -97,7 +97,7 @@ def add_magnet_form():
     <body style="font-family:Arial">
       <h2>Add Magnet Link</h2>
       <form action="/download" method="post">
-        <input type="text" name="magnet" size="80" placeholder="Paste magnet link here" required>
+        <input type="text" name="magnet" size="80" placeholder="Paste magnet link" required>
         <br><br>
         <input type="submit" value="Add to Queue">
       </form>
@@ -105,7 +105,7 @@ def add_magnet_form():
     </body></html>
     """
 
-# ===== Dashboard ===== #
+# ===== Improved Dashboard ===== #
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
@@ -116,7 +116,7 @@ def dashboard():
         body { font-family: Arial; margin: 20px; }
         .torrent { border: 1px solid #ccc; padding: 10px; margin-bottom: 15px; }
         .progress-container { background: #eee; height: 20px; border-radius: 5px; overflow:hidden; }
-        .progress-bar { background: #4caf50; height: 100%; width: 0%; }
+        .progress-bar { background: #4caf50; height: 100%; width: 0%; transition: width 0.5s; }
       </style>
     </head>
     <body>
@@ -126,36 +126,61 @@ def dashboard():
       <div id="completed"></div>
       <script>
       async function loadProgress(){
-        const r = await fetch('/progress');
-        const data = await r.json();
-        const c = document.getElementById('active');
-        c.innerHTML='';
-        for(const [magnet, info] of Object.entries(data.active_downloads)){
-          let prog = parseFloat(info.progress)||0;
-          c.innerHTML += `<div class="torrent">
-              <div><b>Status:</b> ${info.status}</div>
-              <div><b>Magnet:</b> ${magnet}</div>
-              <div><b>Speed:</b> ${info.download_speed} |
-                   <b>Peers:</b> ${info.peers} |
-                   <b>ETA:</b> ${info.eta}</div>
-              <div><b>Progress:</b> ${info.progress}</div>
-              <div class="progress-container">
-                  <div class="progress-bar" style="width:${prog}%;"></div>
-              </div>
-          </div>`;
+        try {
+          const r = await fetch('/progress');
+          const data = await r.json();
+          const c = document.getElementById('active');
+          c.innerHTML = '';
+          for (const [magnet, info] of Object.entries(data.active_downloads)) {
+            const prog = info.progress ? parseFloat(info.progress) : 0;
+            const status = info.status || "Unknown";
+            const speed = info.download_speed || "0 KB/s";
+            const peers = (info.peers !== undefined && info.peers !== null) ? info.peers : "N/A";
+            const eta = info.eta || "Unknown";
+
+            c.innerHTML += `<div class="torrent">
+                <div><b>Status:</b> ${status}</div>
+                <div><b>Magnet:</b> ${magnet}</div>
+                <div><b>Speed:</b> ${speed} |
+                     <b>Peers:</b> ${peers} |
+                     <b>ETA:</b> ${eta}</div>
+                <div><b>Progress:</b> ${info.progress || "0%"} </div>
+                <div class="progress-container">
+                    <div class="progress-bar" style="width:${prog}%;"></div>
+                </div>
+            </div>`;
+          }
+          if (Object.keys(data.active_downloads).length === 0) {
+            c.innerHTML = "<p>No active downloads</p>";
+          }
+        } catch (err) {
+          console.error("Error loading progress:", err);
         }
       }
+
       async function loadCompleted(){
-        const r = await fetch('/completed');
-        const data = await r.json();
-        const c = document.getElementById('completed');
-        c.innerHTML='';
-        for(const [magnet, files] of Object.entries(data.completed_files)){
-          files.forEach(f=>{
-            c.innerHTML += `<div><a href="${f.download_url}" target="_blank">${f.file}</a></div>`;
-          });
+        try {
+          const r = await fetch('/completed');
+          const data = await r.json();
+          const c = document.getElementById('completed');
+          c.innerHTML = '';
+          let hasFiles = false;
+          for (const [magnet, files] of Object.entries(data.completed_files)) {
+            files.forEach(f => {
+              hasFiles = true;
+              const fileName = f.file || "Unnamed file";
+              const url = f.download_url || "#";
+              c.innerHTML += `<div><a href="${url}" target="_blank">${fileName}</a></div>`;
+            });
+          }
+          if (!hasFiles) {
+            c.innerHTML = "<p>No completed downloads</p>";
+          }
+        } catch (err) {
+          console.error("Error loading completed:", err);
         }
       }
+
       async function refresh(){
         await loadProgress();
         await loadCompleted();
@@ -233,4 +258,4 @@ async def cancel_download(request: Request):
         download_queue.remove(magnet)
         return {"status": "Removed from queue"}
     return {"status": "Not found"}
-         
+    
