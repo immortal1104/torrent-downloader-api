@@ -37,67 +37,103 @@ async def handle_download(magnet):
     try:
         from torrentp import TorrentDownloader
     except ImportError:
-        add_log(magnet, "ERROR: torrentp not installed.")
+        add_log(magnet, "ERROR: torrentp not installed")
         return
 
-    torrent = TorrentDownloader(magnet, DOWNLOAD_DIR)
-    active_downloads[magnet] = {"status": "Connecting to peers..."}
-    add_log(magnet, "Queued for download")
-
-    await torrent.start_download()
-    add_log(magnet, "Torrent client started")
-
-    no_peer_start_time = None
-    while torrent.status.is_downloading:
-        peers = torrent.status.num_peers
-        progress = torrent.status.progress
-        speed_bps = torrent.status.download_rate or 0
-        total_size = torrent.status.total_size or 0
-
-        add_log(magnet, f"Peers={peers}, Progress={progress:.2f}%, Speed={speed_bps/1024:.2f}KB/s")
-        if peers == 0:
-            if no_peer_start_time is None:
-                no_peer_start_time = asyncio.get_running_loop().time()
-                add_log(magnet, "No peers, timer started")
-            elif asyncio.get_running_loop().time() - no_peer_start_time > 120:
-                add_log(magnet, "Auto-cancel: no peers for 2m")
-                await torrent.stop_download()
-                active_downloads.pop(magnet, None)
-                downloading_tasks.pop(magnet, None)
-                return
-        else:
-            no_peer_start_time = None
-
-        eta_str = "Calculating..."
-        if speed_bps > 0 and progress < 100 and total_size > 0:
-            bytes_remaining = total_size * (100 - progress) / 100
-            eta_seconds = bytes_remaining / speed_bps
-            m, s = divmod(int(eta_seconds), 60)
-            eta_str = f"{m:02d}:{s:02d}"
-
+    try:
+        torrent = TorrentDownloader(magnet, DOWNLOAD_DIR)
+        
+        # Initialize with safe defaults
         active_downloads[magnet] = {
-            "status": "Downloading",
-            "progress": f"{progress:.2f}%",
-            "download_speed": f"{speed_bps / 1024:.2f} KB/s",
-            "peers": peers,
-            "eta": eta_str,
-            "file_size": f"{total_size / (1024*1024):.2f} MB" if total_size > 0 else "Unknown",
+            "status": "Connecting to peers...",
+            "progress": "0.00%",
+            "download_speed": "0 KB/s",
+            "peers": 0,
+            "eta": "Calculating...",
+            "file_size": "Unknown",
             "logs": debug_logs.get(magnet, [])
         }
-        await asyncio.sleep(2)
+        
+        add_log(magnet, "Initializing torrent download")
 
-    if torrent.status.is_finished:
-        add_log(magnet, "Download complete")
-        active_downloads.pop(magnet, None)
-        completed_files[magnet] = []
-        for file in torrent.files:
-            path = os.path.join(DOWNLOAD_DIR, file)
-            if os.path.exists(path):
-                completed_files[magnet].append({
-                    "file": file,
-                    "download_url": f"/file/{file}"
-                })
+        await torrent.start_download()
+        add_log(magnet, "Torrent client started")
+
+        no_peer_start_time = None
+        update_count = 0
+        
+        while torrent.status.is_downloading:
+            update_count += 1
+            
+            # Safe extraction with defaults
+            peers = getattr(torrent.status, 'num_peers', 0) or 0
+            progress = getattr(torrent.status, 'progress', 0) or 0.0
+            speed_bps = getattr(torrent.status, 'download_rate', 0) or 0
+            total_size = getattr(torrent.status, 'total_size', 0) or 0
+
+            add_log(magnet, f"Update #{update_count}: Peers={peers}, Progress={progress:.2f}%, Speed={speed_bps/1024:.1f}KB/s")
+
+            # Handle no peers timeout
+            if peers == 0:
+                if no_peer_start_time is None:
+                    no_peer_start_time = asyncio.get_running_loop().time()
+                    add_log(magnet, "No peers detected - starting timeout timer")
+                elif asyncio.get_running_loop().time() - no_peer_start_time > 120:
+                    add_log(magnet, "Auto-cancelling: no peers for 2 minutes")
+                    await torrent.stop_download()
+                    active_downloads.pop(magnet, None)
+                    downloading_tasks.pop(magnet, None)
+                    return
+            else:
+                no_peer_start_time = None
+
+            # Calculate ETA safely
+            eta_str = "Calculating..."
+            if speed_bps > 100 and progress > 0 and progress < 100 and total_size > 0:
+                bytes_remaining = total_size * (100 - progress) / 100
+                eta_seconds = int(bytes_remaining / speed_bps)
+                h, remainder = divmod(eta_seconds, 3600)
+                m, s = divmod(remainder, 60)
+                if h > 0:
+                    eta_str = f"{h:01d}:{m:02d}:{s:02d}"
+                else:
+                    eta_str = f"{m:02d}:{s:02d}"
+
+            # Update with guaranteed safe values
+            active_downloads[magnet] = {
+                "status": "Downloading" if peers > 0 else "Waiting for peers...",
+                "progress": f"{max(0, min(100, progress)):.2f}%",
+                "download_speed": f"{speed_bps / 1024:.1f} KB/s" if speed_bps > 0 else "0 KB/s",
+                "peers": max(0, peers),
+                "eta": eta_str,
+                "file_size": f"{total_size / (1024*1024):.1f} MB" if total_size > 0 else "Unknown",
+                "logs": debug_logs.get(magnet, [])
+            }
+            
+            await asyncio.sleep(3)
+
+        # Handle completion
+        if hasattr(torrent.status, 'is_finished') and torrent.status.is_finished:
+            add_log(magnet, "Download completed successfully")
+            active_downloads.pop(magnet, None)
+            completed_files[magnet] = []
+            
+            if hasattr(torrent, 'files') and torrent.files:
+                for file in torrent.files:
+                    path = os.path.join(DOWNLOAD_DIR, file)
+                    if os.path.exists(path):
+                        completed_files[magnet].append({
+                            "file": file,
+                            "download_url": f"/file/{file}"
+                        })
+                        add_log(magnet, f"File ready: {file}")
+            
         await torrent.stop_download()
+        
+    except Exception as e:
+        add_log(magnet, f"ERROR: {str(e)}")
+        active_downloads.pop(magnet, None)
+    finally:
         downloading_tasks.pop(magnet, None)
 
 @app.on_event("startup")
@@ -120,7 +156,23 @@ def dashboard():
       <style>
         .progress { height: 24px; }
         .torrent { margin-bottom: 24px; }
-        .log-box { background: #20242a; color: #8af372; font-size: 12px; padding: 5px 10px; border-radius: 7px; max-height: 70px; overflow-y: auto; }
+        .log-box { 
+          background: #1e1e1e; 
+          color: #00ff00; 
+          font-family: monospace;
+          font-size: 11px; 
+          padding: 8px; 
+          border-radius: 4px; 
+          max-height: 80px; 
+          overflow-y: auto; 
+          white-space: pre-wrap;
+        }
+        .magnet-text {
+          word-break: break-all;
+          font-size: 11px;
+          max-height: 40px;
+          overflow: hidden;
+        }
       </style>
     </head>
     <body class="bg-light">
@@ -130,9 +182,9 @@ def dashboard():
           <input type="text" id="magnet" class="form-control" placeholder="Paste magnet link" required />
           <button class="btn btn-success" type="submit">Add Torrent</button>
         </form>
-        <h2>Active Torrents</h2>
+        <h2>Active Torrents (<span id="activeCount">0</span>)</h2>
         <div id="active"></div>
-        <h2 class="mt-4">Completed Torrents</h2>
+        <h2 class="mt-4">Completed Torrents (<span id="completedCount">0</span>)</h2>
         <div id="completed"></div>
       </div>
       <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
@@ -140,62 +192,116 @@ def dashboard():
         function refreshDashboard() {
           $.get("/progress", function(data){
             let activeHTML = '';
+            let activeCount = 0;
+            
             for(const mag in data.active){
+              activeCount++;
               const info = data.active[mag];
-              const prog = parseFloat(info.progress) || 0;
-              const logs = (info.logs || []).join('<br>');
+              
+              // Safe value extraction with fallbacks
+              const progress = info.progress || "0.00%";
+              const eta = info.eta || "Unknown";
+              const fileSize = info.file_size || "Unknown"; 
+              const peers = (info.peers !== undefined && info.peers !== null) ? info.peers : "N/A";
+              const speed = info.download_speed || "0 KB/s";
+              const status = info.status || "Unknown";
+              
+              const prog = parseFloat(progress) || 0;
+              const logs = (info.logs || []).join('\\n');
+              
               activeHTML += `
                 <div class="torrent card shadow-sm mb-3">
                   <div class="card-body">
-                    <div><strong>Status:</strong> ${info.status}</div>
-                    <div class="small text-muted mb-1">${mag}</div>
-                    <div><strong>Progress:</strong> ${info.progress} &nbsp;|&nbsp; <strong>ETA:</strong> ${info.eta} &nbsp;|&nbsp; <strong>Size:</strong> ${info.file_size} &nbsp;|&nbsp; <strong>Peers:</strong> ${info.peers} &nbsp;|&nbsp; <strong>Speed:</strong> ${info.download_speed}</div>
+                    <div><strong>Status:</strong> ${status}</div>
+                    <div class="magnet-text text-muted mb-2">${mag}</div>
+                    <div class="row mb-2">
+                      <div class="col-md-6"><strong>Progress:</strong> ${progress}</div>
+                      <div class="col-md-6"><strong>ETA:</strong> ${eta}</div>
+                    </div>
+                    <div class="row mb-2">
+                      <div class="col-md-4"><strong>Size:</strong> ${fileSize}</div>
+                      <div class="col-md-4"><strong>Peers:</strong> ${peers}</div>
+                      <div class="col-md-4"><strong>Speed:</strong> ${speed}</div>
+                    </div>
                     <div class="progress my-2">
-                      <div class="progress-bar bg-success progress-bar-striped progress-bar-animated" role="progressbar" style="width:${prog}%">${info.progress}</div>
+                      <div class="progress-bar bg-success progress-bar-striped progress-bar-animated" 
+                           role="progressbar" style="width:${prog}%" aria-valuenow="${prog}" 
+                           aria-valuemin="0" aria-valuemax="100">${progress}</div>
                     </div>
                     <div class="log-box mb-2">${logs}</div>
-                    <button class="btn btn-danger btn-sm delete-btn" data-mag="${mag}">Delete</button>
+                    <button class="btn btn-danger btn-sm delete-btn" data-mag="${mag}">Cancel Download</button>
                   </div>
                 </div>`;
             }
-            $("#active").html(activeHTML || "<p>No active downloads</p>");
+            $("#active").html(activeHTML || "<p class='text-muted'>No active downloads</p>");
+            $("#activeCount").text(activeCount);
 
             let completedHTML = '';
+            let completedCount = 0;
             for(const mag in data.completed){
               data.completed[mag].forEach(f => {
-                completedHTML += `<div class="mb-2"><a class="btn btn-outline-primary btn-sm" href="${f.download_url}" target="_blank">${f.file}</a></div>`;
+                completedCount++;
+                const fileName = f.file || "Unknown file";
+                const downloadUrl = f.download_url || "#";
+                completedHTML += `
+                  <div class="mb-2">
+                    <a class="btn btn-outline-success btn-sm" href="${downloadUrl}" target="_blank">
+                      📁 ${fileName}
+                    </a>
+                  </div>`;
               });
             }
-            $("#completed").html(completedHTML || "<p>No completed downloads</p>");
+            $("#completed").html(completedHTML || "<p class='text-muted'>No completed downloads</p>");
+            $("#completedCount").text(completedCount);
 
-            $('.delete-btn').click(function(){
+            $('.delete-btn').off('click').on('click', function(){
               let mag = $(this).data('mag');
+              $(this).prop('disabled', true).text('Cancelling...');
               $.ajax({
                 type: "POST",
                 url: "/delete",
                 contentType: "application/json",
                 data: JSON.stringify({magnet: mag}),
-                success: function(){ refreshDashboard(); }
+                success: function(){ 
+                  refreshDashboard(); 
+                },
+                error: function(){
+                  $(this).prop('disabled', false).text('Cancel Download');
+                }
               });
             });
+          }).fail(function(){
+            $("#active").html("<p class='text-danger'>Failed to load progress data</p>");
           });
         }
 
         $("#addForm").submit(function(e){
           e.preventDefault();
-          let mag = $("#magnet").val();
+          let mag = $("#magnet").val().trim();
           if(mag){
+            $("button[type=submit]").prop('disabled', true).text('Adding...');
             $.ajax({
               type: "POST",
               url: "/add",
               contentType: "application/json",
               data: JSON.stringify({magnet: mag}),
-              success: function(){ $("#magnet").val(''); refreshDashboard(); }
+              success: function(response){ 
+                if(response.added) {
+                  $("#magnet").val(''); 
+                  refreshDashboard();
+                }
+                $("button[type=submit]").prop('disabled', false).text('Add Torrent');
+              },
+              error: function(){
+                $("button[type=submit]").prop('disabled', false).text('Add Torrent');
+                alert('Failed to add torrent');
+              }
             });
           }
         });
 
-        setInterval(refreshDashboard, 3000);
+        // Refresh every 4 seconds
+        setInterval(refreshDashboard, 4000);
         refreshDashboard();
       </script>
     </body>
@@ -204,33 +310,40 @@ def dashboard():
 
 @app.post("/add")
 async def add_torrent(request: Request):
-    data = await request.json()
-    magnet = data.get("magnet")
-    if magnet and magnet not in active_downloads and magnet not in download_queue:
-        download_queue.append(magnet)
-        return {"added": True}
-    return {"added": False}
+    try:
+        data = await request.json()
+        magnet = data.get("magnet", "").strip()
+        if magnet and magnet.startswith("magnet:") and magnet not in active_downloads and magnet not in download_queue:
+            download_queue.append(magnet)
+            return {"added": True, "message": "Torrent queued successfully"}
+        return {"added": False, "message": "Invalid or duplicate magnet link"}
+    except Exception as e:
+        return {"added": False, "message": str(e)}
 
 @app.post("/delete")
 async def delete_torrent(request: Request):
-    data = await request.json()
-    magnet = data.get("magnet")
-    if magnet in downloading_tasks:
-        downloading_tasks[magnet].cancel()
-        active_downloads.pop(magnet, None)
-        downloading_tasks.pop(magnet, None)
-        debug_logs[magnet] = ["Cancelled by user."]
-        return {"deleted": True}
-    if magnet in download_queue:
-        download_queue.remove(magnet)
-        return {"deleted": True}
-    return {"deleted": False}
+    try:
+        data = await request.json()
+        magnet = data.get("magnet")
+        if magnet in downloading_tasks:
+            downloading_tasks[magnet].cancel()
+            active_downloads.pop(magnet, None)
+            downloading_tasks.pop(magnet, None)
+            add_log(magnet, "Cancelled by user")
+            return {"deleted": True, "message": "Download cancelled"}
+        if magnet in download_queue:
+            download_queue.remove(magnet)
+            return {"deleted": True, "message": "Removed from queue"}
+        return {"deleted": False, "message": "Torrent not found"}
+    except Exception as e:
+        return {"deleted": False, "message": str(e)}
 
 @app.get("/progress")
 def get_progress():
     return {
         "active": active_downloads,
         "completed": completed_files,
+        "queue_length": len(download_queue)
     }
 
 @app.get("/file/{filename}")
@@ -239,3 +352,4 @@ def serve_file(filename: str):
     if os.path.exists(path):
         return FileResponse(path, filename=filename)
     return {"error": "File not found"}
+    
