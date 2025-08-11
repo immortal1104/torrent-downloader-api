@@ -1,300 +1,495 @@
+# app.py
 import asyncio
+import json
 import os
 import time
 from collections import deque
+from datetime import datetime
 from pathlib import Path
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import PlainTextResponse, HTMLResponse, FileResponse, Response
+from typing import Dict, Any
+
+from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+
+# ---- torrentp import ----
+# Make sure torrentp is installed in your environment.
 from torrentp import TorrentDownloader
 
+# ========== CONFIG ==========
+# On Render attach a persistent disk and set DOWNLOAD_DIR to its mount point (e.g. /downloads).
+DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/downloads")).resolve()
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+STATE_FILE = DOWNLOAD_DIR / "state.json"
+MAX_ACTIVE_DOWNLOADS = int(os.environ.get("MAX_ACTIVE_DOWNLOADS", 2))
+PEER_TIMEOUT_SECONDS = int(os.environ.get("PEER_TIMEOUT_SECONDS", 120))
+
+# ========== GLOBAL STATE ==========
 app = FastAPI()
+queue = deque()                 # magnets waiting
+active_downloads: Dict[str, Any] = {}   # magnet -> TorrentDownloader instance (or metadata)
+completed_files = []            # list of {filename, size, completed_at, magnet}
+state_lock = asyncio.Lock()     # protects state file & in-memory structures
 
-# ===== Config ===== #
-DOWNLOAD_DIR = './downloads'
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-MAX_ACTIVE_DOWNLOADS = 2
+# helper: read/write state.json (queue + completed)
+async def load_state():
+    global queue, completed_files
+    if STATE_FILE.exists():
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            q = data.get("queue", [])
+            comp = data.get("completed", [])
+            queue = deque(q)
+            completed_files = comp
+            print(f"[STATE] Loaded queue {len(q)} items and {len(comp)} completed entries")
+        except Exception as e:
+            print(f"[STATE] Failed to load state.json: {e}")
 
-download_queue = deque()
-active_downloads = {}
-completed_files = {}
-downloading_tasks = {}
+async def save_state():
+    async with state_lock:
+        tmp = STATE_FILE.with_suffix(".tmp")
+        payload = {"queue": list(queue), "completed": completed_files}
+        try:
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(STATE_FILE)
+        except Exception as e:
+            print(f"[STATE] Failed saving state: {e}")
 
-# ===== Background Worker ===== #
+# small helper to call start/stop which may be sync or async in torrentp
+async def maybe_await(fn, *args, **kwargs):
+    try:
+        # try coroutine first
+        coro = fn(*args, **kwargs)
+        if asyncio.iscoroutine(coro):
+            return await coro
+        # else run in thread
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    except TypeError:
+        # fallback - call in thread
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    except Exception:
+        # re-raise to be handled by caller
+        raise
+
+# ========= DOWNLOAD WORKER ==========
 async def download_worker():
     while True:
-        if len(active_downloads) < MAX_ACTIVE_DOWNLOADS and download_queue:
-            magnet = download_queue.popleft()
+        # Start as many as allowed
+        while len(active_downloads) < MAX_ACTIVE_DOWNLOADS and queue:
+            magnet = queue.popleft()
+            # schedule worker
             task = asyncio.create_task(handle_download(magnet))
-            downloading_tasks[magnet] = task
-        await asyncio.sleep(2)
+            # store a placeholder so dashboard shows it's active immediately
+            active_downloads[magnet] = {"status": "Queued -> Starting", "task": task}
+            await save_state()
+        await asyncio.sleep(1)
 
-# ===== Download Handler ===== #
-async def handle_download(magnet):
-    torrent = TorrentDownloader(magnet, DOWNLOAD_DIR)
-    active_downloads[magnet] = {"status": "Connecting to peers..."}
-    await torrent.start_download()
-
-    no_peer_start_time = None
-    start_time = time.time()
-
-    while not torrent.status.is_finished:
-        peers = torrent.status.num_peers or 0
-        progress = torrent.status.progress or 0.0
-        speed_bps = torrent.status.download_rate or 0
-
-        # Auto-cancel if no peers for > 2 min
-        if peers == 0:
-            if no_peer_start_time is None:
-                no_peer_start_time = time.time()
-            elif time.time() - no_peer_start_time > 120:
-                print(f"[AUTO-CANCEL] No peers for 2 minutes: {magnet}")
-                await torrent.stop_download()
-                active_downloads.pop(magnet, None)
-                downloading_tasks.pop(magnet, None)
-                return
-        else:
-            no_peer_start_time = None
-
-        # ETA
-        eta_str = "Calculating..."
-        if speed_bps > 0 and progress < 100.0:
-            bytes_remaining = (torrent.status.total_size * (100 - progress)) / 100
-            eta_seconds = bytes_remaining / speed_bps
-            m, s = divmod(int(eta_seconds), 60)
-            eta_str = f"{m:02d}:{s:02d}"
-
-        active_downloads[magnet] = {
-            "status": "Downloading",
-            "progress": f"{progress:.2f}%",
-            "download_speed": f"{speed_bps / 1024:.2f} KB/s",
-            "peers": peers,
-            "eta": eta_str
-        }
-        await asyncio.sleep(2)
-
-    # On completion
-    if torrent.status.is_finished:
-        active_downloads.pop(magnet, None)
-        completed_files[magnet] = []
-        for file in torrent.files:
-            path = Path(DOWNLOAD_DIR) / file
-            if path.exists():
-                completed_files[magnet].append({
-                    "file": file,
-                    "size": f"{path.stat().st_size / (1024*1024):.2f} MB",
-                    "finished_at": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())),
-                    "download_url": f"/file/{file}"
-                })
-        print(f"✅ Finished: {torrent.files}")
-
-    await torrent.stop_download()
-    downloading_tasks.pop(magnet, None)
-
-# ===== Startup ===== #
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(download_worker())
-
-# ===== HTML Form ===== #
-@app.get("/add-magnet", response_class=HTMLResponse)
-def add_magnet_form():
-    return """
-    <html><head><title>Add Magnet</title></head>
-    <body style="font-family:Arial">
-      <h2>Add Magnet Link</h2>
-      <form action="/download" method="post">
-        <input type="text" name="magnet" size="80" placeholder="Paste magnet link here" required>
-        <br><br>
-        <input type="submit" value="Add to Queue">
-      </form>
-      <p><a href="/dashboard" target="_blank">View Dashboard</a></p>
-    </body></html>
+async def handle_download(magnet: str):
     """
+    Create TorrentDownloader, start downloading, update active_downloads dict,
+    persist completed files.
+    """
+    try:
+        torrent = TorrentDownloader(magnet, str(DOWNLOAD_DIR))
+    except Exception as e:
+        print(f"[ERROR] Creating TorrentDownloader for {magnet}: {e}")
+        active_downloads.pop(magnet, None)
+        return
 
-# ===== Bootstrap Dashboard ===== #
-@app.get("/dashboard", response_class=HTMLResponse)
+    # persist the torrent instance and metadata
+    active_downloads[magnet] = {"status": "Connecting to peers...", "torrent": torrent}
+
+    try:
+        # Try to start download (works whether start_download is async or sync)
+        try:
+            await maybe_await(torrent.start_download)
+        except Exception as e:
+            # If starting fails, mark error and return
+            print(f"[ERROR] start_download failed for {magnet}: {e}")
+            active_downloads[magnet]["status"] = f"Error starting: {e}"
+            await asyncio.sleep(3)
+            active_downloads.pop(magnet, None)
+            return
+
+        # Monitor peer availability & progress
+        no_peer_start = None
+        start_ts = time.time()
+
+        # Ensure torrent.status attributes exist, poll until finished
+        while True:
+            st = getattr(torrent, "status", None)
+            if st is None:
+                # If status not available yet, wait a bit
+                active_downloads[magnet]["status"] = "Initializing..."
+                await asyncio.sleep(1)
+                continue
+
+            # read status safely (use getattr default values)
+            is_downloading = getattr(st, "is_downloading", False)
+            is_finished = getattr(st, "is_finished", False)
+            num_peers = getattr(st, "num_peers", 0) or 0
+            progress = getattr(st, "progress", 0.0) or 0.0
+            dl_rate = getattr(st, "download_rate", 0) or 0
+
+            # update live metadata for dashboard
+            active_downloads[magnet].update({
+                "status": "Downloading" if is_downloading else ("Finished" if is_finished else "Connecting"),
+                "progress": round(progress, 2) if isinstance(progress, (float, int)) else progress,
+                "download_speed_bps": dl_rate,
+                "peers": num_peers,
+                "eta": getattr(st, "eta", None)
+            })
+
+            # peer timeout handling
+            if num_peers == 0:
+                if no_peer_start is None:
+                    no_peer_start = time.time()
+                elif time.time() - no_peer_start > PEER_TIMEOUT_SECONDS:
+                    # auto cancel
+                    print(f"[AUTO-CANCEL] No peers for {PEER_TIMEOUT_SECONDS}s for magnet: {magnet}")
+                    try:
+                        await maybe_await(torrent.stop_download)
+                    except Exception:
+                        pass
+                    active_downloads.pop(magnet, None)
+                    await save_state()
+                    return
+            else:
+                no_peer_start = None
+
+            # finished?
+            if is_finished:
+                # collect files from torrent.files if available otherwise fallback
+                files = getattr(torrent, "files", None)
+                if files:
+                    for f in files:
+                        path = (DOWNLOAD_DIR / f).resolve()
+                        # ensure file inside download dir
+                        if path.exists() and DOWNLOAD_DIR in path.parents or path.parent == DOWNLOAD_DIR:
+                            size = path.stat().st_size
+                            completed_files.append({
+                                "magnet": magnet,
+                                "filename": f,
+                                "size": size,
+                                "completed_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                            })
+                else:
+                    # fallback attempt to use a name in status
+                    sname = getattr(torrent.status, "name", None)
+                    if sname:
+                        path = (DOWNLOAD_DIR / sname).resolve()
+                        if path.exists():
+                            size = path.stat().st_size
+                            completed_files.append({
+                                "magnet": magnet,
+                                "filename": sname,
+                                "size": size,
+                                "completed_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                            })
+
+                # persist and remove from active
+                await save_state()
+                print(f"[DONE] magnet: {magnet}")
+                active_downloads.pop(magnet, None)
+                # stop torrent properly
+                try:
+                    await maybe_await(torrent.stop_download)
+                except Exception:
+                    pass
+                return
+
+            await asyncio.sleep(1)
+
+    except asyncio.CancelledError:
+        print(f"[CANCELLED] {magnet}")
+        try:
+            await maybe_await(torrent.stop_download)
+        except Exception:
+            pass
+        active_downloads.pop(magnet, None)
+        await save_state()
+    except Exception as exc:
+        print(f"[ERROR] download loop for {magnet}: {exc}")
+        active_downloads.pop(magnet, None)
+        await save_state()
+
+# ========== FASTAPI STARTUP ==========
+@app.on_event("startup")
+async def on_startup():
+    await load_state()
+    # resume worker
+    asyncio.create_task(download_worker())
+    # autosave loop to ensure frequent persistence (saves every 10s if there are changes)
+    asyncio.create_task(autosave_loop())
+
+async def autosave_loop():
+    last_saved = 0
+    while True:
+        # save every 10 seconds
+        if time.time() - last_saved > 10:
+            await save_state()
+            last_saved = time.time()
+        await asyncio.sleep(5)
+
+# ========== ROUTES ==========
+@app.get("/", response_class=HTMLResponse)
 def dashboard():
-    return """
-    <html>
-    <head>
-      <title>Torrent Dashboard</title>
-      <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    </head>
-    <body class="bg-light">
-      <div class="container my-4">
-        <h1 class="mb-4 text-center">📥 Torrent Dashboard</h1>
+    return DASHBOARD_HTML
 
-        <!-- Active Downloads -->
-        <div class="card mb-4 shadow-sm">
-          <div class="card-header bg-primary text-white">Active Downloads</div>
-          <div class="card-body" id="active">
-            <p class="text-muted">Loading...</p>
+@app.post("/add")
+async def add_torrent(magnet: str = Form(...)):
+    magnet = magnet.strip()
+    if not magnet:
+        raise HTTPException(status_code=400, detail="Empty magnet")
+    # dedupe: check active, queue, completed
+    if magnet in active_downloads or magnet in queue or any(c["magnet"] == magnet for c in completed_files):
+        return JSONResponse({"status": "exists"})
+    queue.append(magnet)
+    await save_state()
+    return JSONResponse({"status": "queued", "queue_position": len(queue)})
+
+@app.get("/status")
+async def status():
+    # Build response from in-memory state (active_downloads, queue, completed_files)
+    active = []
+    for magnet, info in active_downloads.items():
+        # info may either be dict metadata or TorrentDownloader instance container
+        if isinstance(info, dict) and info.get("torrent"):
+            st = getattr(info["torrent"], "status", None)
+        elif hasattr(info, "status"):
+            st = getattr(info, "status", None)
+        else:
+            st = None
+
+        entry = {"magnet": magnet}
+        if st:
+            entry.update({
+                "name": getattr(st, "name", None),
+                "progress": round(getattr(st, "progress", 0.0) or 0.0, 2),
+                "peers": getattr(st, "num_peers", None),
+                "download_speed_bps": getattr(st, "download_rate", None),
+                "eta": getattr(st, "eta", None),
+                "is_downloading": getattr(st, "is_downloading", False),
+                "is_finished": getattr(st, "is_finished", False),
+            })
+        else:
+            # if no status object, try to report stored metadata
+            entry.update({
+                "status": info.get("status") if isinstance(info, dict) else "starting"
+            })
+        active.append(entry)
+
+    return {
+        "active": active,
+        "queue": list(queue),
+        "completed": completed_files,
+        "download_dir": str(DOWNLOAD_DIR)
+    }
+
+@app.post("/cancel")
+async def cancel(request: Request):
+    body = await request.json()
+    magnet = body.get("magnet")
+    if not magnet:
+        raise HTTPException(status_code=400, detail="Provide {'magnet': '...'} in JSON body")
+    # cancel active
+    if magnet in active_downloads:
+        info = active_downloads[magnet]
+        task = None
+        torrent = None
+        if isinstance(info, dict):
+            task = info.get("task")
+            torrent = info.get("torrent")
+        elif hasattr(info, "status"):
+            torrent = info
+        if task and not task.done():
+            task.cancel()
+        elif torrent:
+            try:
+                await maybe_await(torrent.stop_download)
+            except Exception:
+                pass
+        active_downloads.pop(magnet, None)
+        await save_state()
+        return {"status": "cancelled"}
+    # remove from queue
+    if magnet in queue:
+        try:
+            queue.remove(magnet)
+        except ValueError:
+            pass
+        await save_state()
+        return {"status": "removed_from_queue"}
+    return {"status": "not_found"}
+
+@app.get("/file/{filename}")
+def download_file(filename: str):
+    # sanitize / prevent path traversal
+    fname = Path(filename).name
+    path = (DOWNLOAD_DIR / fname).resolve()
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    # ensure file inside download dir
+    if DOWNLOAD_DIR not in path.parents and path.parent != DOWNLOAD_DIR:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return FileResponse(str(path), filename=fname)
+
+# ========== DASHBOARD HTML (Bootstrap + Cancel buttons) ==========
+DASHBOARD_HTML = f"""
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <title>Torrent Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"/>
+    <style> body{{padding:20px;background:#f8f9fa}} .progress{{height:22px}} .small-muted{{color:#6c757d}} </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1 class="mb-4">📥 Torrent Dashboard</h1>
+
+      <div class="card mb-3">
+        <div class="card-body">
+          <form id="addForm" class="row g-2">
+            <div class="col-md-9">
+              <input name="magnet" class="form-control" placeholder="Paste magnet link here" required />
+            </div>
+            <div class="col-md-3">
+              <button class="btn btn-primary w-100" type="submit">Add to Queue</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="col-lg-6">
+          <div class="card mb-3">
+            <div class="card-header bg-primary text-white">Active Downloads</div>
+            <ul class="list-group list-group-flush" id="activeList"><li class="list-group-item text-muted">Loading...</li></ul>
+          </div>
+
+          <div class="card mb-3">
+            <div class="card-header bg-warning">Queue</div>
+            <ul class="list-group list-group-flush" id="queueList"><li class="list-group-item text-muted">Loading...</li></ul>
           </div>
         </div>
 
-        <!-- Queue -->
-        <div class="card mb-4 shadow-sm">
-          <div class="card-header bg-warning">Queue</div>
-          <div class="card-body" id="queue">
-            <p class="text-muted">Loading...</p>
+        <div class="col-lg-6">
+          <div class="card mb-3">
+            <div class="card-header bg-success text-white">Completed</div>
+            <ul class="list-group list-group-flush" id="completedList"><li class="list-group-item text-muted">Loading...</li></ul>
           </div>
-        </div>
 
-        <!-- Completed Downloads -->
-        <div class="card mb-4 shadow-sm">
-          <div class="card-header bg-success text-white">Completed Downloads</div>
-          <div class="card-body" id="completed">
-            <p class="text-muted">Loading...</p>
+          <div class="card mb-3">
+            <div class="card-body">
+              <p class="mb-1"><strong>Download directory</strong></p>
+              <p class="small-muted" id="downloadDir">{DOWNLOAD_DIR}</p>
+              <p class="mb-0 small-muted">Make sure Render has a persistent disk mounted to this path.</p>
+            </div>
           </div>
         </div>
       </div>
 
-      <script>
-      async function loadProgress(){
-        const r = await fetch('/progress');
-        const data = await r.json();
-        const c = document.getElementById('active');
-        c.innerHTML = '';
-        for (const [magnet, info] of Object.entries(data.active_downloads)) {
-          const prog = info.progress ? parseFloat(info.progress) : 0;
-          const badgeClass = info.status.includes("Downloading") ? "bg-info" : "bg-secondary";
-          c.innerHTML += `
-            <div class="mb-3">
-              <h6><span class="badge ${badgeClass}">${info.status}</span></h6>
-              <div class="small text-break"><b>Magnet:</b> ${magnet}</div>
-              <div class="small"><b>Speed:</b> ${info.download_speed} | <b>Peers:</b> ${info.peers} | <b>ETA:</b> ${info.eta}</div>
-              <div class="progress mt-2">
-                <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:${prog}%">
-                  ${info.progress}
-                </div>
-              </div>
-            </div>
-          `;
-        }
-        if (Object.keys(data.active_downloads).length === 0) {
-          c.innerHTML = "<p class='text-muted'>No active downloads</p>";
-        }
-      }
+    </div>
 
-      async function loadQueue(){
-        const r = await fetch('/queue');
-        const data = await r.json();
-        const c = document.getElementById('queue');
-        if (data.queue.length > 0) {
-          c.innerHTML = '<ul class="list-group">';
-          data.queue.forEach((m, i) => {
-            c.innerHTML += `<li class="list-group-item"><b>${i+1}.</b> ${m}</li>`;
-          });
-          c.innerHTML += '</ul>';
-        } else {
-          c.innerHTML = "<p class='text-muted'>Queue is empty</p>";
-        }
-      }
+    <script>
+      async function refreshUI() {{
+        try {{
+          const res = await fetch('/status');
+          const data = await res.json();
 
-      async function loadCompleted(){
-        const r = await fetch('/completed');
-        const data = await r.json();
-        const c = document.getElementById('completed');
-        let html = '';
-        let hasFiles = false;
-        for (const [magnet, files] of Object.entries(data.completed_files)) {
-          files.forEach(f => {
-            hasFiles = true;
-            html += `<div class="mb-2">
-              <a href="${f.download_url}" target="_blank" class="text-decoration-none">${f.file}</a>
-              <span class="badge bg-secondary">${f.size}</span>
-              <small class="text-muted">Finished at ${f.finished_at}</small>
-            </div>`;
-          });
-        }
-        c.innerHTML = hasFiles ? html : "<p class='text-muted'>No completed downloads</p>";
-      }
+          // Active
+          const activeList = document.getElementById('activeList');
+          activeList.innerHTML = '';
+          if (data.active.length === 0) {{
+            activeList.innerHTML = '<li class="list-group-item text-muted">No active downloads</li>';
+          }} else {{
+            for (const t of data.active) {{
+              const speedKb = t.download_speed_bps ? Math.round(t.download_speed_bps / 1024) : 0;
+              const progress = t.progress !== undefined ? t.progress : 0;
+              activeList.innerHTML += `
+                <li class="list-group-item">
+                  <div class="d-flex justify-content-between">
+                    <div><strong>${{t.name || t.magnet}}</strong><br><small class="text-muted">${{t.magnet}}</small></div>
+                    <div>
+                      <button class="btn btn-sm btn-outline-danger" onclick="cancelMagnet('${{encodeURIComponent(t.magnet)}}')">Cancel</button>
+                    </div>
+                  </div>
+                  <div class="mt-2">
+                    <div class="progress">
+                      <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:${{progress}}%">${{progress}}%</div>
+                    </div>
+                    <div class="mt-1 small text-muted">${{speedKb}} kB/s | Peers: ${{t.peers ?? 'N/A'}} | ETA: ${{t.eta ?? 'N/A'}}</div>
+                  </div>
+                </li>`;
+            }}
+          }}
 
-      async function refresh(){
-        await loadProgress();
-        await loadQueue();
-        await loadCompleted();
-      }
-      setInterval(refresh, 2000); refresh();
-      </script>
-    </body>
-    </html>
-    """
+          // Queue
+          const queueList = document.getElementById('queueList');
+          queueList.innerHTML = '';
+          if (data.queue.length === 0) {{
+            queueList.innerHTML = '<li class="list-group-item text-muted">Queue is empty</li>';
+          }} else {{
+            data.queue.forEach((m, i) => {{
+              queueList.innerHTML += `<li class="list-group-item d-flex justify-content-between align-items-start">
+                <div class="me-2"><small class="text-muted">${{i+1}}.</small> <span class="text-break">${{m}}</span></div>
+                <button class="btn btn-sm btn-outline-secondary" onclick="cancelMagnet('${{encodeURIComponent(m)}}')">Remove</button>
+              </li>`;
+            }});
+          }}
 
-# ===== API Endpoints ===== #
-@app.get("/")
-def home():
-    return {"message": "Torrent Downloader API running (Local storage only)"}
+          // Completed
+          const completedList = document.getElementById('completedList');
+          completedList.innerHTML = '';
+          if (data.completed.length === 0) {{
+            completedList.innerHTML = '<li class="list-group-item text-muted">No completed files</li>';
+          }} else {{
+            for (const c of data.completed) {{
+              const sizeMB = (c.size / (1024*1024)).toFixed(2);
+              completedList.innerHTML += `<li class="list-group-item">
+                <div><a href="/file/${{encodeURIComponent(c.filename)}}">${{c.filename}}</a></div>
+                <div class="small text-muted">${{sizeMB}} MB • ${{c.completed_at}}</div>
+              </li>`;
+            }}
+          }}
 
-@app.post("/download")
-async def download_torrent(request: Request, magnet: str = Form(None)):
-    if not magnet:
-        try:
-            data = await request.json()
-            magnet = data.get("magnet")
-        except:
-            return {"error": "Provide magnet in form or JSON"}
-    if not magnet:
-        return {"error": "No magnet link provided"}
-    if magnet in active_downloads or magnet in download_queue or magnet in completed_files:
-        return {"status": "Already queued/downloading/completed"}
-    download_queue.append(magnet)
-    return {"status": "Queued", "queue_position": len(download_queue)}
+        }} catch (err) {{
+          console.error("Refresh error:", err);
+        }}
+      }}
 
-@app.get("/queue")
-def get_queue():
-    return {"queue": list(download_queue)}
+      async function cancelMagnet(magnetEncoded) {{
+        const magnet = decodeURIComponent(magnetEncoded);
+        try {{
+          await fetch('/cancel', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ magnet }})
+          }});
+        }} catch (e) {{
+          console.error("Cancel failed", e);
+        }}
+        setTimeout(refreshUI, 500);
+      }}
 
-@app.get("/progress")
-def get_progress():
-    return {"active_downloads": active_downloads}
+      document.getElementById('addForm').onsubmit = async (e) => {{
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        await fetch('/add', {{ method: 'POST', body: fd }});
+        e.target.reset();
+        setTimeout(refreshUI, 300);
+      }};
 
-@app.get("/progress-text", response_class=PlainTextResponse)
-def get_progress_text():
-    if not active_downloads:
-        return "No active downloads"
-    lines = []
-    for magnet, info in active_downloads.items():
-        lines.append(f"Magnet: {magnet}")
-        for k, v in info.items():
-            lines.append(f"{k.capitalize()}: {v}")
-        lines.append("")
-    return "\n".join(lines)
+      setInterval(refreshUI, 2000);
+      refreshUI();
+    </script>
+  </body>
+</html>
+"""
 
-@app.get("/completed")
-def list_completed():
-    return {"completed_files": completed_files}
-
-@app.get("/file/{filename}")
-def download_file(filename: str):
-    path = Path(DOWNLOAD_DIR) / filename
-    if path.exists() and path.is_file() and path.resolve().parent == Path(DOWNLOAD_DIR).resolve():
-        return FileResponse(str(path), filename=filename)
-    return {"error": "File not found"}
-
-@app.post("/cancel")
-async def cancel_download(request: Request):
-    data = await request.json()
-    magnet = data.get("magnet")
-    if not magnet:
-        return {"error": "Provide {'magnet':'link'}"}
-    if magnet in downloading_tasks:
-        downloading_tasks[magnet].cancel()
-        active_downloads.pop(magnet, None)
-        downloading_tasks.pop(magnet, None)
-        return {"status": "Cancelled active download"}
-    if magnet in download_queue:
-        download_queue.remove(magnet)
-        return {"status": "Removed from queue"}
-    return {"status": "Not found"}
-
-# ===== Flash crossdomain.xml Support ===== #
-@app.get("/crossdomain.xml")
-def crossdomain():
-    xml = """<?xml version="1.0"?>
-    <!DOCTYPE cross-domain-policy SYSTEM "http://www.macromedia.com/xml/dtds/cross-domain-policy.dtd">
-    <cross-domain-policy>
-        <allow-access-from domain="*" secure="false"/>
-    </cross-domain-policy>
-    """
-    return Response(content=xml, media_type="application/xml")
+# If this file is run directly, start a development server (helpful for local testing).
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=False)
