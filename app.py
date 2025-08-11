@@ -1,6 +1,5 @@
 import asyncio
 import os
-import json
 from collections import deque
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import PlainTextResponse, HTMLResponse
@@ -12,49 +11,39 @@ from googleapiclient.errors import HttpError
 
 app = FastAPI()
 
-# ===== Google Drive Auth (from env var) ===== #
-try:
-    service_account_info = json.loads(os.environ["SERVICE_ACCOUNT_JSON"])
-except KeyError:
-    raise RuntimeError("SERVICE_ACCOUNT_JSON env var not set in Render!")
-
-credentials = service_account.Credentials.from_service_account_info(service_account_info)
+# ===== Google Drive Auth (using local credentials.json file) ===== #
+SERVICE_ACCOUNT_FILE = "credentials.json"  # Must exist in repo root
+credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
 drive_service = build('drive', 'v3', credentials=credentials)
 
-# Optional: specific folder upload
+# Optional: upload into specific folder
 drive_folder_id = os.environ.get("DRIVE_FOLDER_ID", None)
 
 def upload_to_drive(file_path, file_name):
-    """Upload to GDrive, make public, return file_id or None."""
+    """Upload file to Google Drive, make public, return file_id or None."""
     try:
         file_metadata = {'name': file_name}
         if drive_folder_id:
             file_metadata['parents'] = [drive_folder_id]
-
         media = MediaFileUpload(file_path, resumable=True)
         uploaded_file = drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id'
+            body=file_metadata, media_body=media, fields='id'
         ).execute()
-
         file_id = uploaded_file.get('id')
-
-        # Make file public
+        # Make the file public
         drive_service.permissions().create(
             fileId=file_id,
-            body={'type': 'anyone', 'role': 'reader'},
+            body={'type': 'anyone', 'role': 'reader'}
         ).execute()
-
         print(f"[GDRIVE] Uploaded {file_name} - ID: {file_id}")
         return file_id
     except HttpError as e:
-        print(f"[GDRIVE ERROR] HTTP Error uploading {file_name}: {e}")
+        print(f"[GDRIVE ERROR] HTTP error uploading {file_name}: {e}")
     except Exception as e:
         print(f"[GDRIVE ERROR] Failed to upload {file_name}: {e}")
     return None
 
-# ===== Torrent Config ===== #
+# ===== Torrent Downloader Config ===== #
 DOWNLOAD_DIR = './downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 MAX_ACTIVE_DOWNLOADS = 2
@@ -64,7 +53,7 @@ active_downloads = {}
 completed_files = {}
 downloading_tasks = {}
 
-# ===== Worker ===== #
+# ===== Background Worker ===== #
 async def download_worker():
     while True:
         if len(active_downloads) < MAX_ACTIVE_DOWNLOADS and download_queue:
@@ -80,13 +69,12 @@ async def handle_download(magnet):
     await torrent.start_download()
 
     no_peer_start_time = None
-
     while torrent.status.is_downloading:
         peers = torrent.status.num_peers
         progress = torrent.status.progress
         speed_bps = torrent.status.download_rate
 
-        # Auto-cancel
+        # Auto-cancel if no peers for > 2 min
         if peers == 0:
             if no_peer_start_time is None:
                 no_peer_start_time = asyncio.get_running_loop().time()
@@ -99,14 +87,13 @@ async def handle_download(magnet):
         else:
             no_peer_start_time = None
 
-        # ETA calc
+        # ETA calculation
+        eta_str = "Calculating..."
         if speed_bps > 0 and progress < 100.0:
             bytes_remaining = (torrent.status.total_size * (100 - progress)) / 100
             eta_seconds = bytes_remaining / speed_bps
             m, s = divmod(int(eta_seconds), 60)
             eta_str = f"{m:02d}:{s:02d}"
-        else:
-            eta_str = "Calculating..."
 
         active_downloads[magnet] = {
             "status": "Downloading",
@@ -117,7 +104,7 @@ async def handle_download(magnet):
         }
         await asyncio.sleep(2)
 
-    # Completion
+    # On completion
     if torrent.status.is_finished:
         active_downloads.pop(magnet, None)
         completed_files[magnet] = []
@@ -141,12 +128,11 @@ async def handle_download(magnet):
 async def startup_event():
     asyncio.create_task(download_worker())
 
-# ===== HTML Form for manual magnet input ===== #
+# ===== HTML Form for Browser Magnet Input ===== #
 @app.get("/add-magnet", response_class=HTMLResponse)
 def add_magnet_form():
     return """
-    <html>
-    <head><title>Add Magnet</title></head>
+    <html><head><title>Add Magnet</title></head>
     <body style="font-family:Arial">
       <h2>Add Magnet Link</h2>
       <form action="/download" method="post">
@@ -155,8 +141,7 @@ def add_magnet_form():
         <input type="submit" value="Add to Queue">
       </form>
       <p><a href="/dashboard" target="_blank">View Dashboard</a></p>
-    </body>
-    </html>
+    </body></html>
     """
 
 # ===== Real-time Dashboard ===== #
@@ -220,7 +205,7 @@ def dashboard():
 # ===== API Endpoints ===== #
 @app.get("/")
 def home():
-    return {"message": "Torrent Downloader API running"}
+    return {"message": "Torrent Downloader API with Drive Upload running"}
 
 @app.post("/download")
 async def download_torrent(request: Request, magnet: str = Form(None)):
@@ -276,4 +261,3 @@ async def cancel_download(request: Request):
         download_queue.remove(magnet)
         return {"status": "Removed from queue"}
     return {"status": "Not found"}
-    
