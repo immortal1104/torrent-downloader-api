@@ -1,26 +1,44 @@
 import asyncio
+import os
+import json
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 from torrentp import TorrentDownloader
-import os
 from collections import deque
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 app = FastAPI()
 
-# Folder to store downloads
+# ================= Google Drive Setup (from ENV variable) ================= #
+# Make sure in Render, you created an env var: SERVICE_ACCOUNT_JSON
+service_account_info = json.loads(os.environ["SERVICE_ACCOUNT_JSON"])
+credentials = service_account.Credentials.from_service_account_info(service_account_info)
+drive_service = build('drive', 'v3', credentials=credentials)
+
+def upload_to_drive(file_path, file_name):
+    """Uploads a file to Google Drive and returns its file ID."""
+    file_metadata = {'name': file_name}
+    media = MediaFileUpload(file_path, resumable=True)
+    uploaded_file = drive_service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields='id'
+    ).execute()
+    return uploaded_file.get('id')
+
+# ================= Torrent Downloader Config ================= #
 DOWNLOAD_DIR = './downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Maximum simultaneous downloads
 MAX_ACTIVE_DOWNLOADS = 2
-
-# State trackers
 download_queue = deque()
 active_downloads = {}
 completed_files = {}
 downloading_tasks = {}
 
-# ---------------- Background Worker ---------------- #
+# ================= Background Worker ================= #
 async def download_worker():
     while True:
         if len(active_downloads) < MAX_ACTIVE_DOWNLOADS and download_queue:
@@ -29,7 +47,7 @@ async def download_worker():
             downloading_tasks[magnet] = task
         await asyncio.sleep(2)
 
-# ---------------- Torrent Handler ---------------- #
+# ================= Torrent Handler ================= #
 async def handle_download(magnet):
     torrent = TorrentDownloader(magnet, DOWNLOAD_DIR)
     active_downloads[magnet] = {"status": "Connecting to peers..."}
@@ -40,9 +58,9 @@ async def handle_download(magnet):
     while torrent.status.is_downloading:
         peers = torrent.status.num_peers
         progress = torrent.status.progress
-        speed_bps = torrent.status.download_rate  # Bytes/sec
+        speed_bps = torrent.status.download_rate
 
-        # Auto-cancel after 2 minutes of no peers
+        # Auto-cancel if no peers for > 2 mins
         if peers == 0:
             if no_peer_start_time is None:
                 no_peer_start_time = asyncio.get_running_loop().time()
@@ -73,30 +91,45 @@ async def handle_download(magnet):
 
         await asyncio.sleep(2)
 
+    # If download completes
     if torrent.status.is_finished:
         active_downloads.pop(magnet, None)
-        completed_files[magnet] = torrent.files
-        print(f"✅ Finished: {torrent.files}")
+        completed_files[magnet] = []
+
+        for file in torrent.files:
+            local_path = os.path.join(DOWNLOAD_DIR, file)
+            if os.path.exists(local_path):
+                # Upload to Google Drive
+                file_id = upload_to_drive(local_path, file)
+                completed_files[magnet].append({
+                    "file": file,
+                    "drive_id": file_id,
+                    "drive_link": f"https://drive.google.com/file/d/{file_id}/view"
+                })
+                print(f"✅ Uploaded {file} to Google Drive: {file_id}")
+                os.remove(local_path)  # Delete after upload
+
+        print(f"✅ Download finished & uploaded: {torrent.files}")
 
     await torrent.stop_download()
     downloading_tasks.pop(magnet, None)
 
-# ---------------- Startup ---------------- #
+# ================= Startup ================= #
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(download_worker())
 
-# ---------------- API Endpoints ---------------- #
+# ================= API Endpoints ================= #
 @app.get("/")
 def home():
-    return {"message": "Torrent Downloader API with Queue + Auto-Cancel + ETA + Text Output is running!"}
+    return {"message": "Torrent Downloader API with Google Drive Upload, ETA, Auto-Cancel running!"}
 
 @app.post("/download")
 async def download_torrent(request: Request):
     data = await request.json()
     magnet = data.get("magnet")
     if not magnet:
-        return {"error": "Please provide magnet link: {'magnet': 'link'}"}
+        return {"error": "Please provide magnet link"}
     if magnet in active_downloads or magnet in download_queue:
         return {"status": "Already queued or downloading", "magnet": magnet}
     download_queue.append(magnet)
@@ -110,7 +143,6 @@ def get_queue():
 def get_progress():
     return {"active_downloads": active_downloads}
 
-# New plain-text progress endpoint
 @app.get("/progress-text", response_class=PlainTextResponse)
 def get_progress_text():
     if not active_downloads:
@@ -120,36 +152,19 @@ def get_progress_text():
         lines.append(f"Magnet: {magnet}")
         for k, v in info.items():
             lines.append(f"{k.capitalize()}: {v}")
-        lines.append("")  # Empty line between torrents
+        lines.append("")
     return "\n".join(lines)
 
 @app.get("/completed")
 def list_completed():
-    results = []
-    for magnet, files in completed_files.items():
-        for file in files:
-            path = os.path.join(DOWNLOAD_DIR, file)
-            if os.path.exists(path):
-                results.append({
-                    "magnet": magnet,
-                    "file": file,
-                    "download_url": f"/file/{file}"
-                })
-    return {"completed_files": results}
-
-@app.get("/file/{filename}")
-def download_file(filename: str):
-    path = os.path.join(DOWNLOAD_DIR, filename)
-    if os.path.exists(path):
-        return FileResponse(path, filename=filename)
-    return {"error": "File not found"}
+    return {"completed_files": completed_files}
 
 @app.post("/cancel")
 async def cancel_download(request: Request):
     data = await request.json()
     magnet = data.get("magnet")
     if not magnet:
-        return {"error": "Please provide magnet link: {'magnet': 'link'}"}
+        return {"error": "Please provide magnet link"}
 
     if magnet in downloading_tasks:
         downloading_tasks[magnet].cancel()
